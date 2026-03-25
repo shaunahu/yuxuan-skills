@@ -36,6 +36,7 @@ All templates share this opening:
 
 ```
 # [Module Name]
+[give GitHub url if user provided]
 
 ## What it does
 [1–2 sentences. What is the outcome of using this module? Start with the business purpose, not the implementation.]
@@ -49,9 +50,6 @@ All templates share this opening:
 [What does this produce? Describe format and how to interpret the result.]
 
 ## Dependencies
-- ...
-
-## Limitations
 - ...
 ```
 
@@ -77,11 +75,16 @@ Then append the type-specific section below.
 
 ```
 ## Interpreting results
-[Thresholds, confidence scores, label meanings — how should the caller act on the output?]
+[Base model, Parameter setting, Thresholds, confidence scores, label meanings — how should the caller act on the output?]
 
 ## Performance considerations
 [Latency, batch size, memory constraints.]
 [TODO: verify if not in code]
+
+## Evaluation
+
+## Decision Logic
+[Order key steps to explain how the output generated.]
 ```
 
 ---
@@ -112,9 +115,9 @@ Then append the type-specific section below.
 ## When to use it
 [Concrete scenario — when would a developer reach for this?]
 
-## Example
-```python
-# inferred from code
+## How to use it
+[Explain the decision logic in order]
+
 ```
 
 ## Edge cases and gotchas

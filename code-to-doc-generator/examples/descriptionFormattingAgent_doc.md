@@ -1,60 +1,90 @@
 # DescriptionFormattingAgent
 
+https://github.com/aodn/data-discovery-ai/blob/main/data_discovery_ai/agents/descriptionFormattingAgent.py
+
 ## What it does
 
-Converts raw metadata abstracts into clean, consistently structured Markdown — turning long, unformatted text blocks into readable documents with proper lists, links, and paragraph spacing. It is designed to improve the discoverability and readability of dataset descriptions within the AODN data discovery platform.
+Converts raw, unstructured dataset abstract text into clean Markdown format, making it more readable in the data discovery UI. For short or simple descriptions it applies lightweight URL/email link conversion only; for long, multi-paragraph abstracts it calls an LLM (GPT-4o-mini in production, Llama 3 via Ollama in development) to reformat the full text.
 
 ## Inputs
 
 | Name | Type | Description |
 |------|------|-------------|
-| `request` | `Dict[str, str]` | A dictionary containing the metadata to process |
-| `request["title"]` | `str` | The title of the metadata record |
-| `request["abstract"]` | `str` | The raw description/abstract text to be formatted |
+| `title` | `str` | Dataset title — passed to the LLM as context when full formatting is triggered |
+| `abstract` | `str` | Raw description text to be formatted. If absent, agent returns an empty string |
+
+> Supplied as a single `request: Dict[str, str]`. Only abstracts with **more than 200 words AND at least one newline** (`\n`) are sent to the LLM.
 
 ## Outputs / Returns
 
-A dictionary keyed by `model_config.response_key` (configured externally) whose value is a Markdown-formatted string of the abstract. If the abstract is absent, the value is an empty string. If formatting is skipped, the original text is returned with URLs and emails wrapped in Markdown link syntax.
+A dict with a single key defined by `model_config.response_key`, whose value is a Markdown-formatted string. Three possible outcomes:
+
+| Scenario | Output |
+|----------|--------|
+| Request invalid, `abstract` present | URL/email-linked version of the original abstract (no LLM call) |
+| Request invalid, no `abstract` key | `""` (empty string) |
+| Valid request + long abstract | LLM-reformatted Markdown abstract |
 
 ## Dependencies
 
-- `ollama` — local LLM client used in development (llama3 model)
-- `openai` (async client) — used in production/staging via the supervisor's `llm_client`
+- `BaseAgent` — parent class providing `is_valid_request` and `set_required_fields`
+- `ConfigUtil` — loads description formatting config (`model`, `temperature`, `max_tokens`, `response_key`)
+- `LlmModels` enum — distinguishes between `GPT` (OpenAI) and `OLLAMA` (local Llama 3) backends
+- `AgentType` enum — identifies this agent as `DESCRIPTION_FORMATTING`
+- `ollama.chat` — local LLM client used in development
+- `asyncio` — used to run the async GPT chunked-processing path synchronously via `asyncio.run()`
 - `structlog` — structured logging
-- `data_discovery_ai.agents.baseAgent.BaseAgent` — base class providing `is_valid_request` and `set_required_fields`
-- `data_discovery_ai.config.config.ConfigUtil` — loads model config (model name, temperature, max tokens, response key)
-- `data_discovery_ai.enum.agent_enums.LlmModels, AgentType` — enums for model and agent type selection
-- `asyncio`, `re`, `json` — standard library
-
-## Limitations
-
-- Abstracts of 200 words or fewer, or single-paragraph abstracts, are **not sent to the LLM** — only URL/email wrapping is applied.
-- The agent has no memory between calls; all state is per-request.
-- The Ollama (dev) path processes the full abstract in a single prompt, which may degrade quality for very long texts compared to the chunked GPT path.
-- JSON parsing from Ollama responses uses a multi-step fallback strategy because llama3 output formatting is inconsistent.
-- Chunk boundary context is limited to the last sentence of the previous chunk; formatting continuity across large structural boundaries (e.g., a list split across chunks) may degrade.
-- The supervisor reference (`self.supervisor`) must be injected via `set_supervisor()` before calling `execute()`; behaviour without it is not explicitly guarded. [TODO: verify]
 
 ---
 
 ## When it runs
 
-The agent is invoked when a metadata record's abstract needs to be displayed to end users. It is called via `execute()`, which internally decides whether LLM formatting is warranted. A supervisor object must be injected via `set_supervisor()` prior to execution.
+Invoked by a supervisor that holds the `llm_client` (OpenAI async client). Runs during dataset indexing or re-indexing when abstract text needs to be normalised for display.
 
 ## Decision logic
 
-1. **Validate the request** — checks that all required fields are present using `is_valid_request()` (inherited from `BaseAgent`).
-2. **Check if formatting is needed** (`needs_formatting`) — returns `True` only if the abstract exceeds 200 words **and** contains at least one newline character (i.e., has multiple paragraphs). Short or single-paragraph abstracts skip the LLM entirely.
-3. **Apply manual URL/email wrapping** — regardless of whether the LLM is invoked, `manual_wrapper_description()` first converts raw URLs and email addresses in the text to Markdown link syntax (`[text](url)` / `[email](mailto:email)`).
-4. **Route to the correct LLM backend**:
-   - **GPT (production/staging):** Calls `take_action_async()`, which splits the abstract into ≤1000-character chunks at paragraph/sentence boundaries, then formats each chunk sequentially — passing the last sentence of the previous chunk as context to maintain continuity.
-   - **Ollama (development):** Calls the local llama3 model synchronously with the full abstract in a single prompt.
-5. **Parse and return** — extracts the `formatted_abstract` value from the JSON response; falls back to the raw LLM output string if JSON parsing fails at all levels.
+1. **Gate check (`make_decision`)** — two conditions must both be true to trigger the LLM:
+   - `is_valid_request(request)` passes (required fields present), AND
+   - `needs_formatting(abstract)` returns `True` (word count > 200 **and** abstract contains `\n`)
+2. **Short / invalid path** — if either condition fails, apply `manual_wrapper_description()` only: detect bare URLs and email addresses using regex and convert them to Markdown link syntax. No LLM is called.
+3. **Long / valid path** — apply `manual_wrapper_description()` first (link wrapping), then call `take_action()`:
+   - **GPT (production):** runs `take_action_async()`, which splits the abstract into chunks of ≤1000 characters at paragraph/sentence boundaries and calls the OpenAI API sequentially per chunk, passing the last sentence of the previous chunk as context to maintain continuity.
+   - **Ollama (development):** sends the full abstract in a single call to the local Llama 3 model.
+4. **Response parsing (`retrieve_json`)** — extracts the `formatted_abstract` value from the LLM's JSON response. Handles three formats: clean JSON object, triple-quoted JSON (common with Llama), and plain text fallback.
+5. **Error fallback** — any exception in the LLM call returns the (link-wrapped) original abstract unchanged, so downstream consumers always receive something usable.
+6. **Log result** — logs the final response at DEBUG level.
+
+---
+
+## Helper functions quick reference
+
+| Function | Purpose |
+|----------|---------|
+| `needs_formatting(abstract)` | Returns `True` if abstract > 200 words and contains a newline |
+| `manual_wrapper_description(abstract)` | Regex-wraps bare URLs and emails in Markdown link syntax |
+| `chunk_text(text, max_length=1000)` | Splits long text at paragraph/sentence boundaries for chunked LLM calls |
+| `format_chunk_async(...)` | Async call to OpenAI for a single chunk; passes previous tail for continuity |
+| `extract_last_sentence(text)` | Extracts the last sentence of a formatted chunk to use as context for the next |
+| `build_system_prompt()` | Constructs the LLM system prompt with formatting rules |
+| `build_user_prompt(chunk_text, previous_tail)` | Constructs the user prompt with chunk markers and optional previous-tail context |
+| `retrieve_json(model, output)` | Parses `formatted_abstract` from LLM output, with multi-format fallback |
+| `_wrap_url(m)` / `_wrap_email(m)` | Regex match handlers that produce `[text](url)` / `[email](mailto:email)` |
+| `_strip_trailing_punct(s)` | Removes trailing punctuation from URLs/emails before wrapping |
+
+---
+
+## Edge cases and gotchas
+
+- **Chunking is sequential, not parallel** — despite the async signature on `take_action_async`, chunks are processed one-by-one in a `for` loop (not `asyncio.gather`). This is intentional to maintain previous-tail context between chunks. Don't assume parallel speed gains.
+- **Ollama ignores chunking** — the local dev path sends the full abstract in one shot, regardless of length. This may hit token limits for very long abstracts.
+- **`needs_formatting` requires both conditions** — an abstract can be 500 words with no newlines and still skip the LLM. If you're debugging why a long abstract wasn't reformatted, check for the presence of `\n`.
+- **`manual_wrapper_description` always runs before the LLM** in the full-formatting path — so the LLM receives already link-wrapped text. Ensure downstream rendering handles nested Markdown links correctly.
+- **`response_key` is config-driven** — the output dict key name is not hardcoded; check `ConfigUtil` to know what key to read from the response.
 
 ---
 
 Draft generated from code only. Please verify:
-- The exact config path and value of `model_config.response_key` — the output dictionary key depends on this.
-- Whether a missing `self.supervisor` is handled gracefully or raises an unhandled `AttributeError`.
-- Whether `set_required_fields()` is always called before `execute()` in all usage paths (base class validation depends on this).
-- Confirm whether the Ollama path applies chunking for very long abstracts or always uses a single prompt (current code suggests single prompt only).
+- `[TODO: verify]` What exact fields does `BaseAgent.is_valid_request()` require? (not defined in this file)
+- `[TODO: verify]` What is the string value of `model_config.response_key`?
+- `[TODO: verify]` What OpenAI model string does `LlmModels.GPT.value` resolve to? (referenced as GPT-4o-mini in comments but not confirmed in this file)
+- `[TODO: verify]` Confirm whether Ollama path is dev-only or if it is ever used in staging/production environments
